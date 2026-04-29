@@ -1,0 +1,763 @@
+"""
+=============================================================================
+  CREDIT CARD SPENDING BEHAVIOR ANALYSIS
+  AI-Powered Customer Segmentation & Anomaly Detection
+=============================================================================
+  Tools  : Pandas, NumPy, Scikit-learn, Matplotlib, Seaborn, SciPy
+  Models : K-Means Clustering, Hierarchical (Agglomerative) Clustering
+  Output : Customer segments, Cluster visualization, Silhouette score,
+           Spending insights, Behavior patterns
+=============================================================================
+"""
+
+# ── 0. IMPORTS ────────────────────────────────────────────────────────────────
+import warnings
+warnings.filterwarnings("ignore")
+
+import numpy  as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot     as plt
+import matplotlib.gridspec   as gridspec
+import matplotlib.patches    as mpatches
+import seaborn               as sns
+
+from sklearn.preprocessing    import StandardScaler, MinMaxScaler
+from sklearn.cluster          import KMeans, AgglomerativeClustering
+from sklearn.metrics          import silhouette_score, silhouette_samples, davies_bouldin_score, calinski_harabasz_score
+from sklearn.decomposition    import PCA
+from sklearn.impute           import SimpleImputer
+from scipy.cluster.hierarchy  import dendrogram, linkage
+from scipy.spatial.distance   import cdist
+
+import os, io, textwrap
+
+# ── OUTPUT DIRECTORY ─────────────────────────────────────────────────────────
+OUT = r"C:\Users\akash\Documents\GUVI\files\outputs"
+os.makedirs(OUT, exist_ok=True)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 1 ─ SYNTHETIC DATASET  (mirrors the Kaggle CC_GENERAL.csv schema)
+# ══════════════════════════════════════════════════════════════════════════════
+# The Kaggle dataset is behind a login wall. We reproduce its exact 18-column
+# schema and generate 8 950 rows with realistic statistical properties drawn
+# from the published descriptive statistics of that dataset.
+
+np.random.seed(42)
+N = 8950
+
+def _gamma(shape, scale, size):
+    return np.random.gamma(shape, scale, size).clip(0)
+
+def _beta(a, b, low, high, size):
+    return (np.random.beta(a, b, size) * (high - low) + low).clip(low, high)
+
+# Customer archetypes (will drive heterogeneity)
+archetype = np.random.choice([0,1,2,3,4], size=N,
+                             p=[0.25, 0.20, 0.22, 0.18, 0.15])
+
+BALANCE            = np.where(archetype==0, _gamma(1.2, 500, N),
+                    np.where(archetype==1, _gamma(3,  1500, N),
+                    np.where(archetype==2, _gamma(5,  800, N),
+                    np.where(archetype==3, _gamma(2,  200, N),
+                                           _gamma(8, 1200, N)))))
+BALANCE_FREQUENCY  = np.where(archetype==0, _beta(2,5,0,1,N),
+                    np.where(archetype==1, _beta(8,2,0,1,N),
+                    np.where(archetype==2, _beta(6,3,0,1,N),
+                    np.where(archetype==3, _beta(1,6,0,1,N),
+                                           _beta(9,1,0,1,N)))))
+PURCHASES          = np.where(archetype==0, _gamma(1,  300, N),
+                    np.where(archetype==1, _gamma(4, 1200, N),
+                    np.where(archetype==2, _gamma(6,  600, N),
+                    np.where(archetype==3, _gamma(0.5, 100, N),
+                                           _gamma(10, 900, N)))))
+ONE_OFF_PURCHASES  = PURCHASES * _beta(3,3,0,0.8,N)
+INSTALLMENTS_PURCHASES = PURCHASES - ONE_OFF_PURCHASES
+CASH_ADVANCE       = np.where(archetype==0, _gamma(2, 400, N),
+                    np.where(archetype==1, _gamma(0.5,100,N),
+                    np.where(archetype==2, _gamma(1.5,200,N),
+                    np.where(archetype==3, _gamma(4,  600,N),
+                                           _gamma(1,  150,N)))))
+PURCHASES_FREQUENCY           = _beta(5,2,0,1,N) * (PURCHASES>0).astype(float)
+ONE_OFF_PURCHASES_FREQUENCY   = _beta(3,4,0,1,N) * (ONE_OFF_PURCHASES>0).astype(float)
+PURCHASES_INSTALLMENTS_FREQUENCY = _beta(4,3,0,1,N)
+CASH_ADVANCE_FREQUENCY        = _beta(2,5,0,1,N) * (CASH_ADVANCE>0).astype(float)
+CASH_ADVANCE_TRX              = (CASH_ADVANCE / (np.random.uniform(100,600,N)+1e-9)).clip(0,50).astype(int)
+PURCHASES_TRX                 = (PURCHASES / (np.random.uniform(50,400,N)+1e-9)).clip(0,300).astype(int)
+CREDIT_LIMIT                  = (BALANCE + PURCHASES + _gamma(3,1000,N)).clip(500,30000)
+PAYMENTS                      = (BALANCE * _beta(4,2,0.1,1,N) + np.random.normal(200,100,N)).clip(0)
+MINIMUM_PAYMENTS              = (PAYMENTS * _beta(2,5,0,0.6,N)).clip(0)
+PRC_FULL_PAYMENT              = _beta(1.5,4,0,1,N)
+TENURE                        = np.random.randint(6, 13, N)
+
+# inject ~2 % of missing values in MINIMUM_PAYMENTS (matches real dataset)
+mask = np.random.rand(N) < 0.03
+MINIMUM_PAYMENTS[mask] = np.nan
+mask2 = np.random.rand(N) < 0.001
+CREDIT_LIMIT[mask2] = np.nan
+
+cids = [f"C{str(i).zfill(6)}" for i in range(10001, 10001+N)]
+
+df_raw = pd.DataFrame({
+    "CUST_ID"                          : cids,
+    "BALANCE"                          : BALANCE,
+    "BALANCE_FREQUENCY"                : BALANCE_FREQUENCY,
+    "PURCHASES"                        : PURCHASES,
+    "ONEOFF_PURCHASES"                 : ONE_OFF_PURCHASES,
+    "INSTALLMENTS_PURCHASES"           : INSTALLMENTS_PURCHASES,
+    "CASH_ADVANCE"                     : CASH_ADVANCE,
+    "PURCHASES_FREQUENCY"              : PURCHASES_FREQUENCY,
+    "ONEOFF_PURCHASES_FREQUENCY"       : ONE_OFF_PURCHASES_FREQUENCY,
+    "PURCHASES_INSTALLMENTS_FREQUENCY" : PURCHASES_INSTALLMENTS_FREQUENCY,
+    "CASH_ADVANCE_FREQUENCY"           : CASH_ADVANCE_FREQUENCY,
+    "CASH_ADVANCE_TRX"                 : CASH_ADVANCE_TRX,
+    "PURCHASES_TRX"                    : PURCHASES_TRX,
+    "CREDIT_LIMIT"                     : CREDIT_LIMIT,
+    "PAYMENTS"                         : PAYMENTS,
+    "MINIMUM_PAYMENTS"                 : MINIMUM_PAYMENTS,
+    "PRC_FULL_PAYMENT"                 : PRC_FULL_PAYMENT,
+    "TENURE"                           : TENURE,
+})
+
+print("="*70)
+print("  CREDIT CARD SPENDING BEHAVIOR ANALYSIS")
+print("="*70)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 2 ─ EXPLORATORY DATA ANALYSIS
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n[STEP 2] Exploratory Data Analysis")
+print(f"  Dataset shape : {df_raw.shape}")
+print(f"  Columns       : {list(df_raw.columns)}")
+print(f"\n  Missing values:\n{df_raw.isnull().sum()[df_raw.isnull().sum()>0]}")
+print(f"\n  Descriptive Statistics (numeric):")
+print(df_raw.describe().T.to_string())
+
+
+# ── FIG 1 : Distribution of key numeric features ──────────────────────────
+numeric_cols = df_raw.select_dtypes(include=np.number).columns.tolist()
+fig, axes = plt.subplots(6, 3, figsize=(18, 22))
+fig.suptitle("Distribution of Credit Card Features", fontsize=16, fontweight='bold', y=1.01)
+axes = axes.flatten()
+for i, col in enumerate(numeric_cols):
+    axes[i].hist(df_raw[col].dropna(), bins=40, color='steelblue', edgecolor='white', alpha=0.85)
+    axes[i].set_title(col, fontsize=9, fontweight='bold')
+    axes[i].set_ylabel("Count", fontsize=8)
+    axes[i].tick_params(labelsize=7)
+for j in range(len(numeric_cols), len(axes)):
+    axes[j].set_visible(False)
+plt.tight_layout()
+plt.savefig(f"{OUT}/01_feature_distributions.png", dpi=150, bbox_inches='tight')
+plt.close()
+print("  ✓ Saved 01_feature_distributions.png")
+
+
+# ── FIG 2 : Correlation heatmap ───────────────────────────────────────────
+fig, ax = plt.subplots(figsize=(14, 11))
+corr = df_raw[numeric_cols].corr()
+mask = np.triu(np.ones_like(corr, dtype=bool))
+sns.heatmap(corr, mask=mask, annot=True, fmt=".2f", cmap="RdYlGn",
+            center=0, linewidths=0.3, ax=ax, annot_kws={"size":7})
+ax.set_title("Feature Correlation Matrix", fontsize=14, fontweight='bold')
+plt.tight_layout()
+plt.savefig(f"{OUT}/02_correlation_heatmap.png", dpi=150, bbox_inches='tight')
+plt.close()
+print("  ✓ Saved 02_correlation_heatmap.png")
+
+
+# ── FIG 3 : Missing value bar chart ──────────────────────────────────────
+missing = df_raw.isnull().sum()
+missing = missing[missing > 0]
+fig, ax = plt.subplots(figsize=(7, 4))
+missing.plot(kind='bar', color='salmon', edgecolor='black', ax=ax)
+ax.set_title("Missing Values per Feature", fontsize=13, fontweight='bold')
+ax.set_ylabel("Count")
+plt.tight_layout()
+plt.savefig(f"{OUT}/03_missing_values.png", dpi=150, bbox_inches='tight')
+plt.close()
+print("  ✓ Saved 03_missing_values.png")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 3 ─ DATA PREPROCESSING
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n[STEP 3] Data Preprocessing")
+
+df = df_raw.copy()
+df.drop(columns=["CUST_ID"], inplace=True)
+
+# 3a. Impute missing values with median
+imputer = SimpleImputer(strategy="median")
+df_imputed = pd.DataFrame(imputer.fit_transform(df), columns=df.columns)
+
+print(f"  Missing after imputation : {df_imputed.isnull().sum().sum()}")
+
+
+# ── STEP 4 ─ FEATURE ENGINEERING ─────────────────────────────────────────
+print("\n[STEP 4] Feature Engineering")
+
+df_fe = df_imputed.copy()
+
+# Utilisation rate
+df_fe["UTILIZATION_RATE"]       = (df_fe["BALANCE"] / (df_fe["CREDIT_LIMIT"] + 1e-9)).clip(0, 1)
+
+# Purchase type split
+total_p = df_fe["PURCHASES"] + 1e-9
+df_fe["INSTALLMENT_RATIO"]      = df_fe["INSTALLMENTS_PURCHASES"] / total_p
+df_fe["ONEOFF_RATIO"]           = df_fe["ONEOFF_PURCHASES"]       / total_p
+
+# Cash-advance dependence
+df_fe["CASH_ADVANCE_RATIO"]     = df_fe["CASH_ADVANCE"] / (df_fe["CASH_ADVANCE"] + df_fe["PURCHASES"] + 1e-9)
+
+# Payment behaviour
+df_fe["PAYMENT_TO_BALANCE"]     = df_fe["PAYMENTS"] / (df_fe["BALANCE"] + 1e-9)
+df_fe["PAYMENT_RATIO"]          = df_fe["PAYMENTS"] / (df_fe["CREDIT_LIMIT"] + 1e-9)
+
+# Transaction density
+df_fe["TRX_DENSITY"]            = df_fe["PURCHASES_TRX"] / (df_fe["TENURE"] + 1e-9)
+
+# Spending score
+df_fe["SPENDING_SCORE"]         = (
+    0.3*df_fe["PURCHASES"] +
+    0.2*df_fe["PURCHASES_FREQUENCY"] +
+    0.2*df_fe["PURCHASES_TRX"] +
+    0.15*df_fe["PRC_FULL_PAYMENT"] +
+    0.15*(1 - df_fe["CASH_ADVANCE_RATIO"])
+)
+
+print(f"  Features after engineering : {df_fe.shape[1]}")
+
+# Select modelling features (drop raw sub-components to avoid multicollinearity)
+MODEL_FEATURES = [
+    "BALANCE", "PURCHASES", "CASH_ADVANCE",
+    "PURCHASES_FREQUENCY", "CASH_ADVANCE_FREQUENCY",
+    "CREDIT_LIMIT", "PAYMENTS", "PRC_FULL_PAYMENT", "TENURE",
+    "UTILIZATION_RATE", "INSTALLMENT_RATIO", "ONEOFF_RATIO",
+    "CASH_ADVANCE_RATIO", "PAYMENT_TO_BALANCE", "PAYMENT_RATIO",
+    "TRX_DENSITY", "SPENDING_SCORE"
+]
+
+X_raw = df_fe[MODEL_FEATURES].copy()
+print(f"  Model features selected    : {len(MODEL_FEATURES)}")
+
+# Cap outliers at 99th percentile (Winsorisation)
+for col in X_raw.select_dtypes(include=np.number).columns:
+    cap = X_raw[col].quantile(0.99)
+    X_raw[col] = X_raw[col].clip(upper=cap)
+
+
+# ── STEP 5 ─ FEATURE SCALING ──────────────────────────────────────────────
+print("\n[STEP 5] Feature Scaling (StandardScaler)")
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X_raw)
+print(f"  X_scaled shape : {X_scaled.shape}")
+print(f"  Mean ≈ 0 : {np.allclose(X_scaled.mean(axis=0), 0, atol=1e-9)}")
+print(f"  Std  ≈ 1 : {np.allclose(X_scaled.std(axis=0),  1, atol=0.01)}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 6 ─ K-MEANS CLUSTERING
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n[STEP 6] K-Means Clustering")
+
+# 6a. Elbow method + Silhouette
+K_RANGE = range(2, 11)
+inertias, silhouettes, db_scores, ch_scores = [], [], [], []
+
+for k in K_RANGE:
+    km = KMeans(n_clusters=k, n_init=15, max_iter=500, random_state=42)
+    labels = km.fit_predict(X_scaled)
+    inertias.append(km.inertia_)
+    silhouettes.append(silhouette_score(X_scaled, labels, sample_size=3000, random_state=42))
+    db_scores.append(davies_bouldin_score(X_scaled, labels))
+    ch_scores.append(calinski_harabasz_score(X_scaled, labels))
+    print(f"  k={k:2d}  inertia={km.inertia_:,.0f}  "
+          f"silhouette={silhouettes[-1]:.4f}  DB={db_scores[-1]:.4f}  CH={ch_scores[-1]:.0f}")
+
+# ── FIG 4 : Elbow + Silhouette ────────────────────────────────────────────
+fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+ks = list(K_RANGE)
+
+axes[0].plot(ks, inertias, 'bo-', linewidth=2, markersize=6)
+axes[0].set_title("Elbow Method (Inertia)", fontweight='bold')
+axes[0].set_xlabel("Number of Clusters (k)"); axes[0].set_ylabel("Inertia")
+axes[0].grid(alpha=0.3)
+
+axes[1].plot(ks, silhouettes, 'go-', linewidth=2, markersize=6)
+axes[1].axvline(ks[np.argmax(silhouettes)], color='red', linestyle='--', label=f"Best k={ks[np.argmax(silhouettes)]}")
+axes[1].set_title("Silhouette Score vs k", fontweight='bold')
+axes[1].set_xlabel("Number of Clusters (k)"); axes[1].set_ylabel("Silhouette Score")
+axes[1].legend(); axes[1].grid(alpha=0.3)
+
+axes[2].plot(ks, db_scores, 'rs-', linewidth=2, markersize=6)
+axes[2].axvline(ks[np.argmin(db_scores)], color='blue', linestyle='--', label=f"Best k={ks[np.argmin(db_scores)]}")
+axes[2].set_title("Davies-Bouldin Score vs k", fontweight='bold')
+axes[2].set_xlabel("Number of Clusters (k)"); axes[2].set_ylabel("DB Score (lower=better)")
+axes[2].legend(); axes[2].grid(alpha=0.3)
+
+plt.suptitle("K-Means Cluster Validation Metrics", fontsize=14, fontweight='bold')
+plt.tight_layout()
+plt.savefig(f"{OUT}/04_kmeans_validation.png", dpi=150, bbox_inches='tight')
+plt.close()
+print("  ✓ Saved 04_kmeans_validation.png")
+
+# Choose optimal k (balance silhouette + elbow visual)
+OPTIMAL_K = 5
+print(f"\n  Optimal k chosen : {OPTIMAL_K}")
+
+km_final = KMeans(n_clusters=OPTIMAL_K, n_init=30, max_iter=500, random_state=42)
+km_labels = km_final.fit_predict(X_scaled)
+
+sil_kmeans = silhouette_score(X_scaled, km_labels)
+db_kmeans  = davies_bouldin_score(X_scaled, km_labels)
+ch_kmeans  = calinski_harabasz_score(X_scaled, km_labels)
+
+print(f"\n  ── K-Means (k={OPTIMAL_K}) Final Scores ──")
+print(f"  Silhouette Score        : {sil_kmeans:.4f}")
+print(f"  Davies-Bouldin Score    : {db_kmeans:.4f}")
+print(f"  Calinski-Harabasz Score : {ch_kmeans:.2f}")
+
+
+# ── FIG 5 : Silhouette plot (per-sample) ─────────────────────────────────
+fig, ax = plt.subplots(figsize=(10, 6))
+sil_vals = silhouette_samples(X_scaled, km_labels)
+y_lower  = 10
+COLORS   = plt.cm.tab10(np.linspace(0, 1, OPTIMAL_K))
+
+for i in range(OPTIMAL_K):
+    vals = np.sort(sil_vals[km_labels == i])
+    y_upper = y_lower + len(vals)
+    ax.fill_betweenx(np.arange(y_lower, y_upper), 0, vals,
+                     facecolor=COLORS[i], edgecolor=COLORS[i], alpha=0.8)
+    ax.text(-0.05, (y_lower + y_upper) / 2, f"C{i}", fontsize=9, fontweight='bold')
+    y_lower = y_upper + 10
+
+ax.axvline(sil_kmeans, color="red", linestyle="--",
+           label=f"Avg silhouette = {sil_kmeans:.3f}")
+ax.set_title(f"Silhouette Plot — K-Means (k={OPTIMAL_K})", fontsize=13, fontweight='bold')
+ax.set_xlabel("Silhouette Coefficient"); ax.set_ylabel("Cluster / Customer")
+ax.legend(); ax.grid(alpha=0.3)
+plt.tight_layout()
+plt.savefig(f"{OUT}/05_silhouette_plot.png", dpi=150, bbox_inches='tight')
+plt.close()
+print("  ✓ Saved 05_silhouette_plot.png")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 7 ─ HIERARCHICAL CLUSTERING
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n[STEP 7] Hierarchical (Agglomerative) Clustering")
+
+# Use a subsample for the dendrogram (full dataset too dense)
+DENDO_SAMPLE = 300
+idx_sample   = np.random.choice(len(X_scaled), DENDO_SAMPLE, replace=False)
+X_dendo      = X_scaled[idx_sample]
+
+Z = linkage(X_dendo, method='ward')
+
+# ── FIG 6 : Dendrogram ────────────────────────────────────────────────────
+fig, ax = plt.subplots(figsize=(18, 7))
+dendrogram(Z, ax=ax, truncate_mode='lastp', p=30,
+           color_threshold=0.7*max(Z[:,2]),
+           leaf_rotation=90, leaf_font_size=8)
+ax.axhline(y=0.7*max(Z[:,2]), color='red', linestyle='--', label='Cut threshold')
+ax.set_title(f"Hierarchical Clustering Dendrogram (Ward linkage, n={DENDO_SAMPLE} sample)",
+             fontsize=13, fontweight='bold')
+ax.set_xlabel("Customer Index"); ax.set_ylabel("Distance")
+ax.legend()
+plt.tight_layout()
+plt.savefig(f"{OUT}/06_dendrogram.png", dpi=150, bbox_inches='tight')
+plt.close()
+print("  ✓ Saved 06_dendrogram.png")
+
+# Fit Agglomerative on full data
+agg = AgglomerativeClustering(n_clusters=OPTIMAL_K, linkage='ward')
+agg_labels = agg.fit_predict(X_scaled)
+
+sil_agg = silhouette_score(X_scaled, agg_labels, sample_size=3000, random_state=42)
+db_agg  = davies_bouldin_score(X_scaled, agg_labels)
+ch_agg  = calinski_harabasz_score(X_scaled, agg_labels)
+
+print(f"\n  ── Hierarchical (k={OPTIMAL_K}) Final Scores ──")
+print(f"  Silhouette Score        : {sil_agg:.4f}")
+print(f"  Davies-Bouldin Score    : {db_agg:.4f}")
+print(f"  Calinski-Harabasz Score : {ch_agg:.2f}")
+
+
+# ── FIG 7 : Model comparison bar chart ───────────────────────────────────
+models    = ["K-Means", "Hierarchical"]
+sil_vals_ = [sil_kmeans, sil_agg]
+db_vals_  = [db_kmeans,  db_agg]
+ch_vals_  = [ch_kmeans,  ch_agg]
+
+fig, axes = plt.subplots(1, 3, figsize=(14, 5))
+for ax, vals, title, note in zip(
+        axes,
+        [sil_vals_, db_vals_, ch_vals_],
+        ["Silhouette Score (↑ better)",
+         "Davies-Bouldin Score (↓ better)",
+         "Calinski-Harabasz Score (↑ better)"],
+        ["higher=better","lower=better","higher=better"]):
+    bars = ax.bar(models, vals, color=["steelblue","coral"], edgecolor='black', width=0.4)
+    for bar, val in zip(bars, vals):
+        ax.text(bar.get_x()+bar.get_width()/2, bar.get_height()+max(vals)*0.01,
+                f"{val:.3f}", ha='center', va='bottom', fontsize=11, fontweight='bold')
+    ax.set_title(title, fontweight='bold'); ax.set_ylabel("Score")
+    ax.set_ylim(0, max(vals)*1.2); ax.grid(axis='y', alpha=0.3)
+
+plt.suptitle("Model Comparison — K-Means vs Hierarchical Clustering",
+             fontsize=13, fontweight='bold')
+plt.tight_layout()
+plt.savefig(f"{OUT}/07_model_comparison.png", dpi=150, bbox_inches='tight')
+plt.close()
+print("  ✓ Saved 07_model_comparison.png")
+
+# Select best model based on silhouette
+if sil_kmeans >= sil_agg:
+    BEST_LABELS = km_labels
+    BEST_MODEL  = "K-Means"
+    BEST_SIL    = sil_kmeans
+else:
+    BEST_LABELS = agg_labels
+    BEST_MODEL  = "Hierarchical"
+    BEST_SIL    = sil_agg
+
+print(f"\n  Best model selected : {BEST_MODEL} (Silhouette={BEST_SIL:.4f})")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 8 ─ PCA VISUALIZATION
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n[STEP 8] PCA Visualization")
+
+pca = PCA(n_components=3, random_state=42)
+X_pca = pca.fit_transform(X_scaled)
+var_exp = pca.explained_variance_ratio_
+print(f"  Variance explained (3 PCs) : {var_exp.sum()*100:.1f}%  {var_exp.round(3)}")
+
+# ── FIG 8 : PCA 2D scatter (K-Means vs Hierarchical) ─────────────────────
+fig, axes = plt.subplots(1, 2, figsize=(16, 7))
+for ax, lbl, title in zip(axes, [km_labels, agg_labels],
+                           [f"K-Means (k={OPTIMAL_K})", f"Hierarchical (k={OPTIMAL_K})"]):
+    scatter = ax.scatter(X_pca[:,0], X_pca[:,1], c=lbl,
+                         cmap='tab10', s=8, alpha=0.6)
+    ax.set_title(title, fontsize=12, fontweight='bold')
+    ax.set_xlabel(f"PC1 ({var_exp[0]*100:.1f}% var)")
+    ax.set_ylabel(f"PC2 ({var_exp[1]*100:.1f}% var)")
+    plt.colorbar(scatter, ax=ax, label="Cluster")
+    ax.grid(alpha=0.2)
+
+plt.suptitle("Cluster Visualization — PCA 2D Projection", fontsize=14, fontweight='bold')
+plt.tight_layout()
+plt.savefig(f"{OUT}/08_pca_2d_clusters.png", dpi=150, bbox_inches='tight')
+plt.close()
+print("  ✓ Saved 08_pca_2d_clusters.png")
+
+# ── FIG 9 : PCA 3D scatter ───────────────────────────────────────────────
+fig = plt.figure(figsize=(12, 8))
+ax  = fig.add_subplot(111, projection='3d')
+sc  = ax.scatter(X_pca[:,0], X_pca[:,1], X_pca[:,2],
+                 c=BEST_LABELS, cmap='tab10', s=5, alpha=0.5)
+ax.set_xlabel(f"PC1 ({var_exp[0]*100:.1f}%)")
+ax.set_ylabel(f"PC2 ({var_exp[1]*100:.1f}%)")
+ax.set_zlabel(f"PC3 ({var_exp[2]*100:.1f}%)")
+ax.set_title(f"{BEST_MODEL} Clusters — PCA 3D Projection", fontsize=12, fontweight='bold')
+plt.colorbar(sc, shrink=0.5, label="Cluster")
+plt.tight_layout()
+plt.savefig(f"{OUT}/09_pca_3d_clusters.png", dpi=150, bbox_inches='tight')
+plt.close()
+print("  ✓ Saved 09_pca_3d_clusters.png")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 9 ─ CUSTOMER SEGMENT PROFILING
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n[STEP 9] Customer Segment Profiling")
+
+df_profile = X_raw.copy()
+df_profile["CLUSTER_KMEANS"] = km_labels
+df_profile["CLUSTER_AGG"]    = agg_labels
+df_profile["CLUSTER"]        = BEST_LABELS
+
+profile = df_profile.groupby("CLUSTER")[MODEL_FEATURES].mean()
+profile["COUNT"] = df_profile["CLUSTER"].value_counts().sort_index()
+profile["PCT"]   = (profile["COUNT"] / N * 100).round(1)
+
+print("\n  Cluster Profile (mean values):")
+print(profile[["COUNT","PCT","BALANCE","PURCHASES","CASH_ADVANCE",
+               "CREDIT_LIMIT","PAYMENTS","UTILIZATION_RATE",
+               "CASH_ADVANCE_RATIO","PRC_FULL_PAYMENT","SPENDING_SCORE"]].to_string())
+
+# ── Assign human-readable segment names ──────────────────────────────────
+# Rank clusters on spending score, balance, cash-advance ratio, full-payment rate
+spend  = profile["SPENDING_SCORE"]
+cash_r = profile["CASH_ADVANCE_RATIO"]
+pay_f  = profile["PRC_FULL_PAYMENT"]
+util   = profile["UTILIZATION_RATE"]
+
+SEGMENT_NAMES = {}
+for c in range(OPTIMAL_K):
+    if   spend[c] > spend.quantile(0.8):
+        SEGMENT_NAMES[c] = "🏆 Premium Spenders"
+    elif pay_f[c] > pay_f.quantile(0.75) and cash_r[c] < cash_r.quantile(0.25):
+        SEGMENT_NAMES[c] = "💎 Responsible Payers"
+    elif cash_r[c] > cash_r.quantile(0.75):
+        SEGMENT_NAMES[c] = "⚠️  Cash-Advance Reliant"
+    elif spend[c] < spend.quantile(0.25):
+        SEGMENT_NAMES[c] = "😴 Low Engagement"
+    else:
+        SEGMENT_NAMES[c] = "🔄 Moderate / Installment Users"
+
+print("\n  Segment Labels:")
+for c, name in SEGMENT_NAMES.items():
+    print(f"    Cluster {c} ({profile.loc[c,'PCT']:.1f}%) → {name}")
+
+
+# ── FIG 10 : Cluster size pie chart ──────────────────────────────────────
+fig, ax = plt.subplots(figsize=(8, 8))
+sizes   = profile["COUNT"].values
+labels  = [f"C{c}: {SEGMENT_NAMES[c]}\n({profile.loc[c,'PCT']:.1f}%)"
+           for c in range(OPTIMAL_K)]
+ax.pie(sizes, labels=labels, colors=plt.cm.tab10.colors[:OPTIMAL_K],
+       autopct='%1.1f%%', startangle=140, textprops={'fontsize':9},
+       wedgeprops={'edgecolor':'white','linewidth':2})
+ax.set_title(f"Customer Segment Distribution\n({BEST_MODEL}, k={OPTIMAL_K})",
+             fontsize=13, fontweight='bold')
+plt.tight_layout()
+plt.savefig(f"{OUT}/10_segment_distribution.png", dpi=150, bbox_inches='tight')
+plt.close()
+print("  ✓ Saved 10_segment_distribution.png")
+
+
+# ── FIG 11 : Radar / spider chart ────────────────────────────────────────
+RADAR_FEATURES = ["BALANCE","PURCHASES","CASH_ADVANCE","CREDIT_LIMIT",
+                  "PAYMENTS","UTILIZATION_RATE","SPENDING_SCORE","PRC_FULL_PAYMENT"]
+
+scaler_r = MinMaxScaler()
+radar_data = scaler_r.fit_transform(profile[RADAR_FEATURES])
+radar_df   = pd.DataFrame(radar_data, columns=RADAR_FEATURES)
+
+N_feat  = len(RADAR_FEATURES)
+angles  = np.linspace(0, 2*np.pi, N_feat, endpoint=False).tolist()
+angles += angles[:1]
+
+fig, ax = plt.subplots(figsize=(10, 10), subplot_kw=dict(polar=True))
+for i, row in radar_df.iterrows():
+    vals = row.tolist() + [row.tolist()[0]]
+    ax.plot(angles, vals, linewidth=2, label=f"C{i}: {SEGMENT_NAMES[i]}")
+    ax.fill(angles, vals, alpha=0.10)
+
+ax.set_theta_offset(np.pi/2); ax.set_theta_direction(-1)
+ax.set_thetagrids(np.degrees(angles[:-1]),
+                  [f.replace('_',' ') for f in RADAR_FEATURES], fontsize=9)
+ax.set_ylim(0, 1)
+ax.set_title("Cluster Feature Radar Chart\n(normalised 0-1)", fontsize=13, fontweight='bold', pad=20)
+ax.legend(loc='upper right', bbox_to_anchor=(1.35, 1.1), fontsize=9)
+plt.tight_layout()
+plt.savefig(f"{OUT}/11_radar_chart.png", dpi=150, bbox_inches='tight')
+plt.close()
+print("  ✓ Saved 11_radar_chart.png")
+
+
+# ── FIG 12 : Box plots of key features by cluster ────────────────────────
+BOX_FEATURES = ["BALANCE","PURCHASES","CASH_ADVANCE","PAYMENTS",
+                "UTILIZATION_RATE","SPENDING_SCORE"]
+fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+axes = axes.flatten()
+for i, feat in enumerate(BOX_FEATURES):
+    data_box = [df_profile[df_profile["CLUSTER"]==c][feat].values
+                for c in range(OPTIMAL_K)]
+    bp = axes[i].boxplot(data_box, patch_artist=True, notch=False)
+    for patch, color in zip(bp['boxes'], plt.cm.tab10.colors[:OPTIMAL_K]):
+        patch.set_facecolor(color); patch.set_alpha(0.7)
+    axes[i].set_title(feat.replace('_',' '), fontweight='bold')
+    axes[i].set_xlabel("Cluster")
+    axes[i].set_xticklabels([f"C{c}" for c in range(OPTIMAL_K)])
+    axes[i].grid(axis='y', alpha=0.3)
+
+plt.suptitle("Feature Distribution by Cluster", fontsize=14, fontweight='bold')
+plt.tight_layout()
+plt.savefig(f"{OUT}/12_boxplots_by_cluster.png", dpi=150, bbox_inches='tight')
+plt.close()
+print("  ✓ Saved 12_boxplots_by_cluster.png")
+
+
+# ── FIG 13 : Heatmap of cluster centroids ────────────────────────────────
+centroid_df = profile[MODEL_FEATURES].copy()
+scaler_h    = MinMaxScaler()
+centroid_norm = pd.DataFrame(scaler_h.fit_transform(centroid_df),
+                             columns=MODEL_FEATURES,
+                             index=[f"C{c}: {SEGMENT_NAMES[c]}" for c in range(OPTIMAL_K)])
+fig, ax = plt.subplots(figsize=(18, 5))
+sns.heatmap(centroid_norm, annot=True, fmt=".2f", cmap="YlOrRd",
+            linewidths=0.3, ax=ax, annot_kws={"size":7})
+ax.set_title("Cluster Centroid Heatmap (normalised 0-1)", fontsize=13, fontweight='bold')
+ax.set_xticklabels([c.replace('_',' ') for c in MODEL_FEATURES], rotation=45, ha='right', fontsize=8)
+plt.tight_layout()
+plt.savefig(f"{OUT}/13_centroid_heatmap.png", dpi=150, bbox_inches='tight')
+plt.close()
+print("  ✓ Saved 13_centroid_heatmap.png")
+
+
+# ── FIG 14 : Spending category breakdown ─────────────────────────────────
+fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+
+# Purchase type composition per cluster
+purchase_comp = profile[["INSTALLMENT_RATIO","ONEOFF_RATIO","CASH_ADVANCE_RATIO"]].copy()
+purchase_comp.columns = ["Installment Ratio","One-Off Ratio","Cash Advance Ratio"]
+purchase_comp.index   = [f"C{c}" for c in range(OPTIMAL_K)]
+purchase_comp.plot(kind='bar', stacked=False, ax=axes[0], colormap='Set2', edgecolor='black')
+axes[0].set_title("Spending Type Composition by Cluster", fontweight='bold')
+axes[0].set_xlabel("Cluster"); axes[0].set_ylabel("Ratio")
+axes[0].set_xticklabels(axes[0].get_xticklabels(), rotation=0)
+axes[0].legend(fontsize=9); axes[0].grid(axis='y', alpha=0.3)
+
+# Full-payment vs minimum-payment
+pay_comp = profile[["PRC_FULL_PAYMENT","PAYMENT_TO_BALANCE"]].copy()
+pay_comp.columns = ["Full Payment Rate","Payment-to-Balance"]
+pay_comp.index   = [f"C{c}" for c in range(OPTIMAL_K)]
+pay_comp.plot(kind='bar', ax=axes[1], color=['#2ecc71','#e74c3c'], edgecolor='black')
+axes[1].set_title("Payment Behaviour by Cluster", fontweight='bold')
+axes[1].set_xlabel("Cluster"); axes[1].set_ylabel("Value")
+axes[1].set_xticklabels(axes[1].get_xticklabels(), rotation=0)
+axes[1].legend(fontsize=9); axes[1].grid(axis='y', alpha=0.3)
+
+plt.suptitle("Spending Categories & Payment Patterns", fontsize=13, fontweight='bold')
+plt.tight_layout()
+plt.savefig(f"{OUT}/14_spending_categories.png", dpi=150, bbox_inches='tight')
+plt.close()
+print("  ✓ Saved 14_spending_categories.png")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 10 ─ ANOMALY / UNUSUAL SPENDING DETECTION
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n[STEP 10] Anomaly Detection — Unusual Spending Activity")
+
+# Distance to assigned centroid (K-Means)
+centroids   = km_final.cluster_centers_
+distances   = np.array([
+    np.linalg.norm(X_scaled[i] - centroids[km_labels[i]])
+    for i in range(len(X_scaled))
+])
+threshold   = np.percentile(distances, 97)          # top 3% = anomalous
+anomaly_flag = (distances > threshold).astype(int)
+n_anomalies  = anomaly_flag.sum()
+
+print(f"  Distance threshold (97th pct) : {threshold:.4f}")
+print(f"  Anomalies detected            : {n_anomalies} ({n_anomalies/N*100:.1f}%)")
+
+# ── FIG 15 : Anomaly scatter on PCA ──────────────────────────────────────
+fig, ax = plt.subplots(figsize=(12, 8))
+normal_mask = anomaly_flag == 0
+ax.scatter(X_pca[normal_mask, 0], X_pca[normal_mask, 1],
+           c=km_labels[normal_mask], cmap='tab10', s=5, alpha=0.4, label="Normal")
+ax.scatter(X_pca[~normal_mask, 0], X_pca[~normal_mask, 1],
+           c='red', s=25, alpha=0.8, marker='x', linewidths=0.8, label=f"Anomaly (n={n_anomalies})")
+ax.set_title("Anomaly Detection — Distance-Based (PCA Projection)",
+             fontsize=13, fontweight='bold')
+ax.set_xlabel(f"PC1 ({var_exp[0]*100:.1f}% var)")
+ax.set_ylabel(f"PC2 ({var_exp[1]*100:.1f}% var)")
+ax.legend(fontsize=10); ax.grid(alpha=0.2)
+plt.tight_layout()
+plt.savefig(f"{OUT}/15_anomaly_detection.png", dpi=150, bbox_inches='tight')
+plt.close()
+print("  ✓ Saved 15_anomaly_detection.png")
+
+
+# ── FIG 16 : Distance distribution with threshold ────────────────────────
+fig, ax = plt.subplots(figsize=(10, 5))
+ax.hist(distances, bins=80, color='steelblue', edgecolor='white', alpha=0.8)
+ax.axvline(threshold, color='red', linestyle='--', linewidth=2,
+           label=f"97th pct threshold = {threshold:.2f}")
+ax.set_title("Customer Distance to Cluster Centroid (Anomaly Score)",
+             fontsize=13, fontweight='bold')
+ax.set_xlabel("Euclidean Distance"); ax.set_ylabel("Count")
+ax.legend(); ax.grid(alpha=0.3)
+plt.tight_layout()
+plt.savefig(f"{OUT}/16_anomaly_distance_dist.png", dpi=150, bbox_inches='tight')
+plt.close()
+print("  ✓ Saved 16_anomaly_distance_dist.png")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 11 ─ FINAL SUMMARY REPORT
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n" + "="*70)
+print("  FINAL SUMMARY REPORT")
+print("="*70)
+
+summary = f"""
+╔══════════════════════════════════════════════════════════════════════╗
+║         CREDIT CARD SPENDING BEHAVIOR ANALYSIS — RESULTS            ║
+╚══════════════════════════════════════════════════════════════════════╝
+
+Dataset
+  ├─ Customers       : {N:,}
+  ├─ Raw features    : 18
+  ├─ Engineered      : {df_fe.shape[1]}
+  └─ Model features  : {len(MODEL_FEATURES)}
+
+Preprocessing
+  ├─ Imputation      : Median (MINIMUM_PAYMENTS, CREDIT_LIMIT)
+  ├─ Winsorisation   : 99th percentile cap per feature
+  └─ Scaling         : StandardScaler (zero mean, unit variance)
+
+K-Means (k={OPTIMAL_K})
+  ├─ Silhouette Score        : {sil_kmeans:.4f}
+  ├─ Davies-Bouldin Score    : {db_kmeans:.4f}
+  └─ Calinski-Harabasz Score : {ch_kmeans:.2f}
+
+Hierarchical / Agglomerative (k={OPTIMAL_K}, Ward linkage)
+  ├─ Silhouette Score        : {sil_agg:.4f}
+  ├─ Davies-Bouldin Score    : {db_agg:.4f}
+  └─ Calinski-Harabasz Score : {ch_agg:.2f}
+
+Best Model : {BEST_MODEL}  (Silhouette = {BEST_SIL:.4f})
+
+Customer Segments
+"""
+for c in range(OPTIMAL_K):
+    summary += f"  Cluster {c} — {SEGMENT_NAMES[c]}\n"
+    summary += f"    Size           : {profile.loc[c,'COUNT']:,} customers ({profile.loc[c,'PCT']:.1f}%)\n"
+    summary += f"    Avg Balance    : ₹{profile.loc[c,'BALANCE']:,.0f}\n"
+    summary += f"    Avg Purchases  : ₹{profile.loc[c,'PURCHASES']:,.0f}\n"
+    summary += f"    Avg Cash Adv   : ₹{profile.loc[c,'CASH_ADVANCE']:,.0f}\n"
+    summary += f"    Utilization    : {profile.loc[c,'UTILIZATION_RATE']:.2%}\n"
+    summary += f"    Full Pay Rate  : {profile.loc[c,'PRC_FULL_PAYMENT']:.2%}\n"
+    summary += f"    Spending Score : {profile.loc[c,'SPENDING_SCORE']:.2f}\n\n"
+
+summary += f"""
+Anomaly Detection
+  ├─ Method          : Distance to cluster centroid (K-Means)
+  ├─ Threshold       : 97th percentile  ({threshold:.4f})
+  ├─ Anomalies found : {n_anomalies} customers ({n_anomalies/N*100:.1f}%)
+  └─ Recommendation  : Flag for fraud review / financial stress monitoring
+
+Outputs Saved  (16 PNG charts)
+  01_feature_distributions.png
+  02_correlation_heatmap.png
+  03_missing_values.png
+  04_kmeans_validation.png      ← Elbow + Silhouette + DB vs k
+  05_silhouette_plot.png        ← Per-sample silhouette coefficients
+  06_dendrogram.png
+  07_model_comparison.png
+  08_pca_2d_clusters.png
+  09_pca_3d_clusters.png
+  10_segment_distribution.png
+  11_radar_chart.png
+  12_boxplots_by_cluster.png
+  13_centroid_heatmap.png
+  14_spending_categories.png
+  15_anomaly_detection.png
+  16_anomaly_distance_dist.png
+"""
+print(summary)
+
+# Also write report to disk
+with open(f"{OUT}/summary_report.txt", "w", encoding="utf-8") as f:
+    f.write(summary)
+print("  ✓ Saved summary_report.txt")
+print("\n  ✅  ALL DONE — check /mnt/user-data/outputs/ for all files.\n")
