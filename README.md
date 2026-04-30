@@ -2,36 +2,38 @@
 
 
 
-### 📌 Project Overview
+A leading bank generates vast amounts of transaction data daily but lacks an intelligent system to utilize it. This project develops an AI-powered analysis platform to uncover hidden spending patterns. By analyzing transaction amounts, frequency, and categories, the system transitions the bank toward a data-driven customer intelligence strategy.
 
-This project analyzes customer spending patterns to uncover insights into consumer behavior and credit usage. By leveraging Machine Learning, the system segments customers into distinct groups, helping financial institutions tailor marketing strategies and manage credit risk more effectively.
+🚀 Features
+📊 Behavior Analysis: Evaluates transaction frequency, amounts, and spending categories.
 
+🤖 Customer Segmentation: Grouping customers into meaningful clusters (e.g., high-value spenders vs. conservative users).
 
+⚠️ Anomaly Detection: Identifying unusual or abnormal spending activities that may indicate fraud or financial distress.
 
-### 🚀 Features
+📈 Data-Driven Insights: Enabling personalized offers and improved risk management for the bank.
 
-* **📊 Spending Insights Dashboard**: Interactive charts showing spending by category, gender, and city.
+🛠️ Technologies & Tools
+Note: This project strictly follows the bank's tool restrictions, utilizing only core data science libraries.
 
-* **🤖 Customer Segmentation**: AI-powered clustering to identify high-spenders vs. budget-conscious users.
+* Pandas & NumPy: For data manipulation and numerical processing.
 
-* **📈 Trend Analysis**: Visualizes monthly spending fluctuations and peak usage periods.
+* Scikit-learn: For feature scaling, K-Means, and Hierarchical Clustering.
 
-* **🌐 Streamlit Web App**: A user-friendly interface to explore the data dynamically.
+* Matplotlib & Seaborn: For cluster visualization and validation.
 
+🧠 Applied Models & Methodology
+To identify distinct patterns without deep learning, the following unsupervised learning approach was used:
 
+1. Feature Engineering: Processing payment behavior and transaction frequency.
 
-### 🛠️ Technologies Used
+2. Feature Scaling: Essential preprocessing to ensure all transaction metrics are weighted equally.
 
-* **Python**: Core programming language.
+3. K-Means Clustering: To segment the millions of customers into distinct groups.
 
-* **Pandas & NumPy**: For data cleaning and numerical processing.
+4. Hierarchical Clustering: To understand the relationship and nested patterns between segments.
 
-* **Scikit-learn**: For implementing clustering algorithms (like K-Means).
-
-* **Streamlit**: For building the interactive web dashboard.
-
-* **Matplotlib & Seaborn**: For high-quality statistical visualizations.
-
+5. Cluster Validation: Implementing metrics to ensure the segments are statistically significant.
 
 
 ### ▶️ Live Demo
